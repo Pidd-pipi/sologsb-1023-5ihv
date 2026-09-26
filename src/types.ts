@@ -36,7 +36,23 @@ export interface ComparisonRules {
   candidateWindow: number;
 }
 
+/** 单个版本组合（底本 × 参校本）的校勘进度 */
+export interface PersistedSession {
+  rows: AlignmentRow[];
+  selectedRowId: string;
+}
+
 export interface PersistedCollationState {
+  versions: VersionDocument[];
+  leftVersionId: string;
+  rightVersionId: string;
+  rules: ComparisonRules;
+  /** 键为 `${leftVersionId}::${rightVersionId}`，每组版本组合各存一份 */
+  sessions: Record<string, PersistedSession>;
+}
+
+/** v1 本地草稿结构，仅用于迁移 */
+export interface PersistedCollationStateV1 {
   versions: VersionDocument[];
   leftVersionId: string;
   rightVersionId: string;

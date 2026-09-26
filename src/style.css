@@ -179,6 +179,56 @@ textarea {
   gap: 8px;
 }
 
+.session-list {
+  display: grid;
+  gap: 6px;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #e5e6eb;
+  border-radius: 8px;
+  color: #4e5969;
+  text-align: left;
+  cursor: pointer;
+  background: #fff;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.session-item:hover:not(:disabled) {
+  border-color: #94bfff;
+  background: #f7faff;
+}
+
+.session-item.active {
+  border-color: #165dff;
+  color: #1d2129;
+  background: #e8f3ff;
+}
+
+.session-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.session-names {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-meta {
+  flex-shrink: 0;
+}
+
 .stat-card {
   padding: 10px;
   border: 1px solid #e5e6eb;

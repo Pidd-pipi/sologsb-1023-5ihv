@@ -21,6 +21,9 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  pendingElsewhere,
+  anyUnresolved,
+  sessionSummaries,
   runAlignment,
   recalculate,
   updateRow,
@@ -30,6 +33,7 @@ const {
   acceptAll,
   nextDifference,
   addVersion,
+  activateSession,
   undo,
   redo,
   exportMarkdown,
@@ -185,7 +189,7 @@ function handleKeydown(event: KeyboardEvent) {
 window.addEventListener('keydown', handleKeydown);
 
 const beforeUnload = (event: BeforeUnloadEvent) => {
-  if (unresolvedCount.value > 0) {
+  if (anyUnresolved.value) {
     event.preventDefault();
     event.returnValue = '';
   }
@@ -206,7 +210,7 @@ window.addEventListener('beforeunload', beforeUnload);
           <a-button :disabled="!canUndo" @click="undo">撤销</a-button>
           <a-button :disabled="!canRedo" @click="redo">重做</a-button>
           <a-button type="primary" :loading="processing" @click="runAlignment()">重新自动对齐</a-button>
-          <a-button @click="openImport">导入版本</a-button>
+          <a-button @click="openImport" :disabled="processing">导入版本</a-button>
           <a-dropdown>
             <a-button>导出校勘记</a-button>
             <template #content>
@@ -223,19 +227,43 @@ window.addEventListener('beforeunload', beforeUnload);
         <section class="panel-section">
           <h2 class="panel-title">比对版本</h2>
           <div style="display: grid; gap: 10px">
-            <a-select v-model="leftVersionId" aria-label="底本">
+            <a-select v-model="leftVersionId" aria-label="底本" :disabled="processing">
               <template #prefix>底本</template>
               <a-option v-for="version in versions" :key="version.id" :value="version.id">{{ version.name }}</a-option>
             </a-select>
-            <a-select v-model="rightVersionId" aria-label="参校本">
+            <a-select v-model="rightVersionId" aria-label="参校本" :disabled="processing">
               <template #prefix>参校</template>
               <a-option v-for="version in versions" :key="version.id" :value="version.id">{{ version.name }}</a-option>
             </a-select>
-            <a-button long type="outline" @click="runAlignment()">执行分片自动对齐</a-button>
+            <a-button long type="outline" :loading="processing" @click="runAlignment()">执行分片自动对齐</a-button>
           </div>
           <a-progress v-if="processing" :percent="progress" size="small" style="margin-top: 12px" />
           <div v-if="processing" style="margin-top: 6px; color: #86909c; font-size: 12px">
             正在让出主线程，长文本编辑不会一直卡住
+          </div>
+        </section>
+
+        <section v-if="sessionSummaries.length" class="panel-section">
+          <h2 class="panel-title">校勘组合</h2>
+          <div class="session-list">
+            <button
+              v-for="item in sessionSummaries"
+              :key="item.key"
+              type="button"
+              class="session-item"
+              :class="{ active: item.active }"
+              :disabled="processing"
+              @click="activateSession(item.key)"
+            >
+              <span class="session-names">{{ item.leftName }} × {{ item.rightName }}</span>
+              <span class="session-meta">
+                <a-tag v-if="item.pending" size="small" color="orange">{{ item.pending }} 条待校</a-tag>
+                <a-tag v-else size="small" color="green">无待办</a-tag>
+              </span>
+            </button>
+          </div>
+          <div style="margin-top: 10px; color: #86909c; font-size: 12px; line-height: 1.6">
+            每组组合各自保存配对、校记与接受进度，切回后继续；新组合首次进入会自动对齐。
           </div>
         </section>
 
@@ -309,7 +337,7 @@ window.addEventListener('beforeunload', beforeUnload);
 
         <a-card :bordered="false" :body-style="{ padding: 0 }">
           <a-alert :show-icon="processing" :type="unresolvedCount ? 'warning' : 'success'" style="border-radius: 0">
-            {{ message }}<span v-if="unresolvedCount"> · {{ unresolvedCount }} 条差异尚未接受</span>
+            {{ message }}<span v-if="unresolvedCount"> · 本组合 {{ unresolvedCount }} 条差异尚未接受</span><span v-if="pendingElsewhere"> · 其他组合尚有 {{ pendingElsewhere }} 条待校</span>
           </a-alert>
           <a-table
             class="virtual-table"
