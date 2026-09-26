@@ -1,15 +1,21 @@
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { Message } from '@arco-design/web-vue';
 import { sampleVersions, splitIntoUnits } from '../data';
 import type {
   AlignmentRow,
   ComparisonRules,
-  DifferenceStatus,
-  PersistedCollationState,
+  LegacyCollationState,
+  PairSession,
+  PairSnapshot,
+  PersistedWorkbench,
   TextUnit,
   VersionDocument
 } from '../types';
+import type { DifferenceStatus } from '../types';
 
-const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
+const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v2';
+const LEGACY_STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
+const MAX_HISTORY = 50;
 
 const variantMap: Record<string, string> = {
   為: '为',
@@ -35,7 +41,8 @@ const variantMap: Record<string, string> = {
 };
 
 function clone<T>(value: T): T {
-  return structuredClone(value);
+  // 会话数据全是可 JSON 序列化的纯对象/数组；structuredClone 无法处理 Vue 的响应式代理。
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function yieldToBrowser() {
@@ -170,14 +177,28 @@ function defaultRules(): ComparisonRules {
   return { ignorePunctuation: true, ignoreVariants: true, candidateWindow: 3 };
 }
 
+/** 组合键带方向：同一底本对不同参校本、方向相反的组合各自独立。 */
+export function pairKey(leftVersionId: string, rightVersionId: string) {
+  return `${leftVersionId}::${rightVersionId}`;
+}
+
+function sessionUnresolved(session: PairSession): number {
+  return session.rows.filter((row) => !row.accepted && row.status !== 'same').length;
+}
+
 export function useCollation() {
-  const versions = ref<VersionDocument[]>(clone(sampleVersions));
-  const leftVersionId = ref(versions.value[0].id);
-  const rightVersionId = ref(versions.value[1].id);
+  const versions = ref<VersionDocument[]>([]);
+  const sessions = ref<Record<string, PairSession>>({});
+  const activePairKey = ref('');
+
+  // 以下均为“当前组合”的工作视图，切换组合时整体换入/换出。
+  const leftVersionId = ref('');
+  const rightVersionId = ref('');
   const rows = ref<AlignmentRow[]>([]);
   const rules = ref<ComparisonRules>(defaultRules());
   const selectedRowId = ref('');
-  const selectedRowIds = ref<(string | number)[]>([]);
+  const selectedRowIds = ref<string[]>([]);
+
   const processing = ref(false);
   const progress = ref(0);
   const message = ref('正在载入本地校勘数据…');
@@ -192,39 +213,92 @@ export function useCollation() {
   const acceptedCount = computed(() => rows.value.filter((row) => row.accepted).length);
   const unresolvedCount = computed(() => rows.value.filter((row) => !row.accepted && row.status !== 'same').length);
 
+  /** 左侧“版本组合进度”列表所需的摘要。 */
+  const pairSummaries = computed(() =>
+    Object.values(sessions.value).map((session) => ({
+      key: pairKey(session.leftVersionId, session.rightVersionId),
+      leftName: versions.value.find((item) => item.id === session.leftVersionId)?.name ?? '未知版本',
+      rightName: versions.value.find((item) => item.id === session.rightVersionId)?.name ?? '未知版本',
+      unresolved: sessionUnresolved(session),
+      updatedAt: session.updatedAt,
+      active: pairKey(session.leftVersionId, session.rightVersionId) === activePairKey.value
+    }))
+  );
+
+  /** 任意组合还有待办差异时都提醒，不只是当前组合。 */
+  const totalUnresolvedCount = computed(() =>
+    Object.values(sessions.value).reduce((sum, session) => sum + sessionUnresolved(session), 0)
+  );
+
   function snapshot(): string {
-    const data: PersistedCollationState = {
-      versions: versions.value,
-      leftVersionId: leftVersionId.value,
-      rightVersionId: rightVersionId.value,
+    const data: PairSnapshot = {
       rows: rows.value,
       rules: rules.value,
-      selectedRowId: selectedRowId.value
+      selectedRowId: selectedRowId.value,
+      selectedRowIds: selectedRowIds.value
     };
     return JSON.stringify(data);
   }
 
+  /** 把当前工作视图连同撤销栈写回所属组合。 */
+  function flushActive() {
+    if (!activePairKey.value) return;
+    const session = sessions.value[activePairKey.value];
+    if (!session) return;
+    session.leftVersionId = leftVersionId.value;
+    session.rightVersionId = rightVersionId.value;
+    session.rows = rows.value;
+    session.rules = rules.value;
+    session.selectedRowId = selectedRowId.value;
+    session.selectedRowIds = selectedRowIds.value;
+    session.history = history.value;
+    session.future = future.value;
+    session.updatedAt = new Date().toISOString();
+  }
+
   function persist() {
-    localStorage.setItem(STORAGE_KEY, snapshot());
+    flushActive();
+    // 撤销/重做栈只在本次会话内有效，不写入 localStorage，避免长文本下迅速撑爆配额。
+    const storedSessions = Object.fromEntries(
+      Object.entries(sessions.value).map(([key, session]) => [
+        key,
+        { ...session, history: [], future: [] }
+      ])
+    );
+    const data: PersistedWorkbench = {
+      schema: 2,
+      versions: versions.value,
+      activePairKey: activePairKey.value,
+      sessions: storedSessions
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (error) {
+      console.error('校勘数据写入本地失败', error);
+      Message.warning('本地存储空间不足，本次进度可能无法保存，建议先导出 JSON 备份');
+    }
+  }
+
+  let persistTimer = 0;
+  function schedulePersist() {
+    window.clearTimeout(persistTimer);
+    persistTimer = window.setTimeout(() => persist(), 300);
+  }
+
+  function applySnapshot(raw: string) {
+    const parsed = JSON.parse(raw) as PairSnapshot;
+    rows.value = parsed.rows;
+    rules.value = parsed.rules;
+    selectedRowId.value = parsed.selectedRowId;
+    selectedRowIds.value = parsed.selectedRowIds;
   }
 
   function commit(label: string, mutate: () => void) {
     history.value.push(snapshot());
-    if (history.value.length > 50) history.value.shift();
+    if (history.value.length > MAX_HISTORY) history.value.shift();
     future.value = [];
     mutate();
     message.value = label;
-    persist();
-  }
-
-  function restore(raw: string) {
-    const parsed = JSON.parse(raw) as PersistedCollationState;
-    versions.value = parsed.versions;
-    leftVersionId.value = parsed.leftVersionId;
-    rightVersionId.value = parsed.rightVersionId;
-    rows.value = parsed.rows;
-    rules.value = parsed.rules;
-    selectedRowId.value = parsed.selectedRowId;
     persist();
   }
 
@@ -232,16 +306,122 @@ export function useCollation() {
     const previous = history.value.pop();
     if (!previous) return;
     future.value.push(snapshot());
-    restore(previous);
+    applySnapshot(previous);
     message.value = '已撤销上一步操作';
+    persist();
   }
 
   function redo() {
     const next = future.value.pop();
     if (!next) return;
     history.value.push(snapshot());
-    restore(next);
+    applySnapshot(next);
     message.value = '已重做上一步操作';
+    persist();
+  }
+
+  function loadSession(session: PairSession) {
+    activePairKey.value = pairKey(session.leftVersionId, session.rightVersionId);
+    leftVersionId.value = session.leftVersionId;
+    rightVersionId.value = session.rightVersionId;
+    rows.value = session.rows;
+    rules.value = clone(session.rules);
+    selectedRowId.value = session.selectedRowId;
+    selectedRowIds.value = [...session.selectedRowIds];
+    history.value = [...session.history];
+    future.value = [...session.future];
+  }
+
+  function createSession(leftId: string, rightId: string, initialRules?: ComparisonRules): PairSession {
+    const now = new Date().toISOString();
+    const session: PairSession = {
+      leftVersionId: leftId,
+      rightVersionId: rightId,
+      rows: [],
+      rules: clone(initialRules ?? defaultRules()),
+      selectedRowId: '',
+      selectedRowIds: [],
+      aligned: false,
+      history: [],
+      future: [],
+      createdAt: now,
+      updatedAt: now
+    };
+    sessions.value[pairKey(leftId, rightId)] = session;
+    return session;
+  }
+
+  /**
+   * 切换到另一组版本组合：先存好当前组合的全部进度，再换入目标组合；
+   * 目标组合第一次进入（aligned=false）时自动执行分片对齐。
+   */
+  async function activatePair(leftId: string, rightId: string, beforeSwitch?: () => void) {
+    if (!leftId || !rightId || leftId === rightId) return;
+    if (processing.value) {
+      Message.warning('正在自动对齐，请稍候再切换版本组合');
+      return;
+    }
+    const key = pairKey(leftId, rightId);
+    if (key === activePairKey.value) return;
+
+    beforeSwitch?.();
+    persist();
+
+    let session = sessions.value[key];
+    if (!session) {
+      session = createSession(leftId, rightId, rules.value);
+      message.value = '首次进入该版本组合，正在自动对齐…';
+    } else {
+      message.value = `已切回「${versions.value.find((item) => item.id === leftId)?.name ?? ''} ↔ ${
+        versions.value.find((item) => item.id === rightId)?.name ?? ''
+      }」，继续上次的校勘位置`;
+    }
+    loadSession(session);
+    persist();
+
+    if (!session.aligned) {
+      await runAlignment(false);
+    }
+  }
+
+  /** 底本下拉变化（含选中与当前参校本相同的回退保护）。 */
+  async function changeLeftVersion(nextId: unknown) {
+    const id = String(nextId ?? '');
+    if (!id || id === leftVersionId.value) return;
+    if (id === rightVersionId.value) {
+      Message.warning('底本与参校本不能是同一个版本，已保持当前组合');
+      leftVersionId.value = activeSessionLeft();
+      return;
+    }
+    await activatePair(id, rightVersionId.value);
+  }
+
+  async function changeRightVersion(nextId: unknown) {
+    const id = String(nextId ?? '');
+    if (!id || id === rightVersionId.value) return;
+    if (id === leftVersionId.value) {
+      Message.warning('参校本与底本不能是同一个版本，已保持当前组合');
+      rightVersionId.value = activeSessionRight();
+      return;
+    }
+    await activatePair(leftVersionId.value, id);
+  }
+
+  function activeSessionLeft() {
+    const current = activePairKey.value ? sessions.value[activePairKey.value] : undefined;
+    return current?.leftVersionId ?? '';
+  }
+
+  function activeSessionRight() {
+    const current = activePairKey.value ? sessions.value[activePairKey.value] : undefined;
+    return current?.rightVersionId ?? '';
+  }
+
+  /** 左侧组合列表点击切换；beforeSwitch 用于先带走未保存的校记草稿。 */
+  async function switchPairByKey(key: string, beforeSwitch?: () => void) {
+    const session = sessions.value[key];
+    if (!session) return;
+    await activatePair(session.leftVersionId, session.rightVersionId, beforeSwitch);
   }
 
   async function runAlignment(commitHistory = true) {
@@ -256,12 +436,15 @@ export function useCollation() {
       });
       if (commitHistory) {
         history.value.push(previous);
+        if (history.value.length > MAX_HISTORY) history.value.shift();
         future.value = [];
       }
       rows.value = result;
       selectedRowId.value = result.find((row) => row.status !== 'same')?.id ?? result[0]?.id ?? '';
       selectedRowIds.value = [];
       message.value = `自动对齐完成：${result.filter((row) => row.status !== 'same').length} 处差异`;
+      const session = activePairKey.value ? sessions.value[activePairKey.value] : undefined;
+      if (session) session.aligned = true;
       persist();
     } finally {
       processing.value = false;
@@ -281,11 +464,58 @@ export function useCollation() {
     });
   }
 
+  /** 规则勾选：v-model 已先改值，这里把旧规则与旧行状态记入撤销历史，再按新规则重算。 */
+  function toggleRule(key: 'ignorePunctuation' | 'ignoreVariants') {
+    const previousRules: ComparisonRules = { ...rules.value, [key]: !rules.value[key] };
+    const previousRows = rows.value.map((row) => {
+      if (!row.left || !row.right) return row;
+      const score = Number(
+        similarity(normalized(row.left.text, previousRules), normalized(row.right.text, previousRules)).toFixed(3)
+      );
+      return { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
+    });
+    history.value.push(
+      JSON.stringify({
+        rows: previousRows,
+        rules: previousRules,
+        selectedRowId: selectedRowId.value,
+        selectedRowIds: selectedRowIds.value
+      } satisfies PairSnapshot)
+    );
+    if (history.value.length > MAX_HISTORY) history.value.shift();
+    future.value = [];
+    rows.value = rows.value.map((row) => {
+      if (!row.left || !row.right) return row;
+      const score = Number(
+        similarity(normalized(row.left.text, rules.value), normalized(row.right.text, rules.value)).toFixed(3)
+      );
+      return { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
+    });
+    selectedRowIds.value = [];
+    message.value = '已按比较规则重算差异';
+    persist();
+  }
+
   function updateRow(id: string, patch: Partial<AlignmentRow>) {
     commit('已更新校勘行', () => {
       const row = rows.value.find((item) => item.id === id);
       if (row) Object.assign(row, patch, { manuallyAdjusted: true });
     });
+  }
+
+  /** 切组合前，把详情面板里尚未点“保存”的校勘说明先带走。 */
+  function flushDraftNote(id: string, note: string, source: string) {
+    const row = rows.value.find((item) => item.id === id);
+    if (!row) return;
+    const nextNote = note.trim();
+    const nextSource = source.trim();
+    if (row.note === nextNote && row.source === nextSource) return;
+    history.value.push(snapshot());
+    if (history.value.length > MAX_HISTORY) history.value.shift();
+    future.value = [];
+    row.note = nextNote;
+    row.source = nextSource;
+    row.manuallyAdjusted = true;
   }
 
   function shiftPairing(id: string, direction: -1 | 1) {
@@ -359,6 +589,12 @@ export function useCollation() {
     message.value = '没有更多未接受的差异';
   }
 
+  function selectRow(id: string) {
+    if (selectedRowId.value === id) return;
+    selectedRowId.value = id;
+    schedulePersist();
+  }
+
   function addVersion(name: string, source: string, text: string) {
     const id = `version-${Date.now().toString(36)}`;
     const item: VersionDocument = {
@@ -369,11 +605,10 @@ export function useCollation() {
       units: splitIntoUnits(text, id),
       createdAt: new Date().toISOString()
     };
-    commit(`已导入版本：${item.name}`, () => {
-      versions.value.push(item);
-    });
-    rightVersionId.value = id;
-    void runAlignment();
+    versions.value.push(item);
+    persist();
+    // 新导入的版本与当前底本构成的是全新组合，第一次进入会自动对齐。
+    void activatePair(leftVersionId.value || versions.value[0]?.id || '', id);
   }
 
   function exportMarkdown() {
@@ -413,31 +648,95 @@ export function useCollation() {
     );
   }
 
+  function migrateLegacy(raw: string): PersistedWorkbench | null {
+    try {
+      const legacy = JSON.parse(raw) as LegacyCollationState;
+      if (!Array.isArray(legacy.versions) || !legacy.leftVersionId || !legacy.rightVersionId) return null;
+      const now = new Date().toISOString();
+      const key = pairKey(legacy.leftVersionId, legacy.rightVersionId);
+      const session: PairSession = {
+        leftVersionId: legacy.leftVersionId,
+        rightVersionId: legacy.rightVersionId,
+        rows: Array.isArray(legacy.rows) ? legacy.rows : [],
+        rules: legacy.rules ?? defaultRules(),
+        selectedRowId: legacy.selectedRowId ?? '',
+        selectedRowIds: [],
+        // 旧版本已有对齐结果，不重复自动对齐；撤销栈按新结构重新开始。
+        aligned: Array.isArray(legacy.rows) && legacy.rows.length > 0,
+        history: [],
+        future: [],
+        createdAt: now,
+        updatedAt: now
+      };
+      return { schema: 2, versions: legacy.versions, activePairKey: key, sessions: { [key]: session } };
+    } catch {
+      return null;
+    }
+  }
+
   onMounted(() => {
+    let workbench: PersistedWorkbench | null = null;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        restore(raw);
-        message.value = '已恢复浏览器中的校勘草稿';
-      } else {
-        message.value = '已载入示例版本，正在自动对齐…';
-        void runAlignment(false);
+      if (raw) workbench = JSON.parse(raw) as PersistedWorkbench;
+    } catch (error) {
+      console.error('v2 本地草稿读取失败', error);
+    }
+
+    if (!workbench) {
+      const legacyRaw = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacyRaw) {
+        workbench = migrateLegacy(legacyRaw);
+        if (workbench) message.value = '已从旧版草稿迁移，各版本组合的进度将分别保存';
       }
-    } catch {
-      message.value = '本地草稿读取失败，已载入示例数据';
+    }
+
+    if (!workbench) {
+      versions.value = clone(sampleVersions);
+      const leftId = sampleVersions[0].id;
+      const rightId = sampleVersions[1].id;
+      const session = createSession(leftId, rightId);
+      loadSession(session);
+      persist();
+      message.value = '已载入示例版本，正在自动对齐…';
       void runAlignment(false);
+      return;
+    }
+
+    versions.value = workbench.versions ?? clone(sampleVersions);
+    sessions.value = workbench.sessions ?? {};
+    const first = sessions.value[workbench.activePairKey]
+      ? sessions.value[workbench.activePairKey]
+      : Object.values(sessions.value)[0];
+
+    if (!first) {
+      const leftId = versions.value[0]?.id ?? '';
+      const rightId = versions.value[1]?.id ?? '';
+      const session = createSession(leftId, rightId);
+      loadSession(session);
+      persist();
+      void runAlignment(false);
+      return;
+    }
+
+    loadSession(first);
+    if (!first.aligned) {
+      message.value = '该版本组合尚未对齐，正在自动对齐…';
+      void runAlignment(false);
+    } else {
+      message.value = workbench.schema === 2 ? '已恢复浏览器中的校勘草稿' : '已从旧版草稿迁移，各版本组合的进度将分别保存';
+      persist();
     }
   });
 
-  watch(
-    [leftVersionId, rightVersionId, () => rules.value.ignorePunctuation, () => rules.value.ignoreVariants],
-    () => {
-      if (!processing.value) persist();
-    }
-  );
+  onBeforeUnmount(() => {
+    window.clearTimeout(persistTimer);
+  });
 
   return {
     versions,
+    sessions,
+    activePairKey,
     leftVersionId,
     rightVersionId,
     rows,
@@ -457,20 +756,30 @@ export function useCollation() {
     differenceCount,
     acceptedCount,
     unresolvedCount,
+    totalUnresolvedCount,
+    pairSummaries,
     runAlignment,
     recalculate,
+    toggleRule,
     updateRow,
+    flushDraftNote,
     shiftPairing,
     moveRow,
     acceptRows,
     acceptAll,
     nextDifference,
+    selectRow,
     addVersion,
+    activatePair,
+    switchPairByKey,
+    changeLeftVersion,
+    changeRightVersion,
     undo,
     redo,
     exportMarkdown,
     exportJson,
-    commit
+    commit,
+    schedulePersist
   };
 }
 

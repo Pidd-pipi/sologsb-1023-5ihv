@@ -36,7 +36,42 @@ export interface ComparisonRules {
   candidateWindow: number;
 }
 
-export interface PersistedCollationState {
+/**
+ * 一组（底本 + 参校本）组合各自保存的校勘进度：
+ * 配对结果、比较规则、光标位置、勾选、撤销重做历史都按组合隔离。
+ */
+export interface PairSession {
+  leftVersionId: string;
+  rightVersionId: string;
+  rows: AlignmentRow[];
+  rules: ComparisonRules;
+  selectedRowId: string;
+  selectedRowIds: string[];
+  /** 是否已完成过首次自动对齐；新组合第一次进入时为 false，会自动对齐。 */
+  aligned: boolean;
+  history: string[];
+  future: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 撤销/重做快照只保存当前组合的可编辑切片。 */
+export interface PairSnapshot {
+  rows: AlignmentRow[];
+  rules: ComparisonRules;
+  selectedRowId: string;
+  selectedRowIds: string[];
+}
+
+export interface PersistedWorkbench {
+  schema: 2;
+  versions: VersionDocument[];
+  activePairKey: string;
+  sessions: Record<string, PairSession>;
+}
+
+/** v1 版本保存的是单一全局状态，用于首次启动时迁移。 */
+export interface LegacyCollationState {
   versions: VersionDocument[];
   leftVersionId: string;
   rightVersionId: string;

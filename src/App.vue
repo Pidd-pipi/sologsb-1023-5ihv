@@ -21,20 +21,27 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  totalUnresolvedCount,
+  pairSummaries,
   runAlignment,
-  recalculate,
+  toggleRule,
   updateRow,
+  flushDraftNote,
   shiftPairing,
   moveRow,
   acceptRows,
   acceptAll,
   nextDifference,
+  selectRow,
   addVersion,
+  switchPairByKey,
+  changeLeftVersion,
+  changeRightVersion,
   undo,
   redo,
   exportMarkdown,
   exportJson,
-  commit
+  schedulePersist
 } = useCollation();
 
 const importVisible = ref(false);
@@ -95,7 +102,8 @@ function rowClass(record: AlignmentRow) {
 }
 
 function onSelectionChange(keys: (string | number)[]) {
-  selectedRowIds.value = keys;
+  selectedRowIds.value = keys.map(String);
+  schedulePersist();
 }
 
 function updateStatus(status: unknown) {
@@ -105,7 +113,28 @@ function updateStatus(status: unknown) {
 
 function onRowClick(record: Record<string, unknown>) {
   const row = record as unknown as AlignmentRow;
-  selectedRowId.value = row.id;
+  selectRow(row.id);
+}
+
+/** 切版本组合前先保存当前详情面板里尚未点“保存”的校记草稿。 */
+function beforeSwitchPair() {
+  if (selectedRow.value) {
+    flushDraftNote(selectedRow.value.id, noteDraft.value, sourceDraft.value);
+  }
+}
+
+function onSwitchPair(key: string) {
+  void switchPairByKey(key, beforeSwitchPair);
+}
+
+function onChangeLeftVersion(value: unknown) {
+  beforeSwitchPair();
+  void changeLeftVersion(value);
+}
+
+function onChangeRightVersion(value: unknown) {
+  beforeSwitchPair();
+  void changeRightVersion(value);
 }
 
 function saveAnnotation() {
@@ -185,7 +214,7 @@ function handleKeydown(event: KeyboardEvent) {
 window.addEventListener('keydown', handleKeydown);
 
 const beforeUnload = (event: BeforeUnloadEvent) => {
-  if (unresolvedCount.value > 0) {
+  if (totalUnresolvedCount.value > 0) {
     event.preventDefault();
     event.returnValue = '';
   }
@@ -223,27 +252,72 @@ window.addEventListener('beforeunload', beforeUnload);
         <section class="panel-section">
           <h2 class="panel-title">比对版本</h2>
           <div style="display: grid; gap: 10px">
-            <a-select v-model="leftVersionId" aria-label="底本">
+            <a-select
+              :model-value="leftVersionId"
+              aria-label="底本"
+              :disabled="processing"
+              @change="onChangeLeftVersion"
+            >
               <template #prefix>底本</template>
               <a-option v-for="version in versions" :key="version.id" :value="version.id">{{ version.name }}</a-option>
             </a-select>
-            <a-select v-model="rightVersionId" aria-label="参校本">
+            <a-select
+              :model-value="rightVersionId"
+              aria-label="参校本"
+              :disabled="processing"
+              @change="onChangeRightVersion"
+            >
               <template #prefix>参校</template>
               <a-option v-for="version in versions" :key="version.id" :value="version.id">{{ version.name }}</a-option>
             </a-select>
-            <a-button long type="outline" @click="runAlignment()">执行分片自动对齐</a-button>
+            <a-button long type="outline" :disabled="processing" @click="runAlignment()">执行分片自动对齐</a-button>
           </div>
           <a-progress v-if="processing" :percent="progress" size="small" style="margin-top: 12px" />
           <div v-if="processing" style="margin-top: 6px; color: #86909c; font-size: 12px">
             正在让出主线程，长文本编辑不会一直卡住
+          </div>
+          <a-alert v-else-if="unresolvedCount" type="warning" :show-icon="true" style="margin-top: 12px">
+            当前组合还有 {{ unresolvedCount }} 处差异待处理，切换组合不会丢失进度。
+          </a-alert>
+        </section>
+
+        <section class="panel-section">
+          <div style="display: flex; align-items: center; margin-bottom: 10px">
+            <h2 class="panel-title" style="margin: 0">版本组合进度</h2>
+            <a-tag v-if="totalUnresolvedCount" color="orangered" size="small" style="margin-left: auto">
+              全部待办 {{ totalUnresolvedCount }}
+            </a-tag>
+          </div>
+          <ul class="pair-list" aria-label="已保存的版本组合，点击即可切回继续校勘">
+            <li v-for="pair in pairSummaries" :key="pair.key">
+              <button
+                type="button"
+                class="pair-item"
+                :class="{ 'pair-item-active': pair.active }"
+                :aria-current="pair.active ? 'true' : undefined"
+                @click="onSwitchPair(pair.key)"
+              >
+                <span class="pair-names">
+                  <span class="pair-name">{{ pair.leftName }}</span>
+                  <span class="pair-arrow" aria-hidden="true">↔</span>
+                  <span class="pair-name">{{ pair.rightName }}</span>
+                </span>
+                <a-tag v-if="pair.unresolved" color="orangered" size="small">{{ pair.unresolved }} 待办</a-tag>
+                <a-tag v-else color="green" size="small">已清</a-tag>
+                <a-tag v-if="pair.active" color="arcoblue" size="small">当前</a-tag>
+              </button>
+            </li>
+          </ul>
+          <div style="margin-top: 8px; color: #86909c; font-size: 12px; line-height: 1.6">
+            每组底本 × 参校本各自保留对齐结果、校记、接受状态、光标与撤销历史；新组合首次进入会自动对齐。
           </div>
         </section>
 
         <section class="panel-section">
           <h2 class="panel-title">比较规则</h2>
           <a-space direction="vertical" fill>
-            <a-checkbox v-model="rules.ignorePunctuation" @change="recalculate">忽略标点差异</a-checkbox>
-            <a-checkbox v-model="rules.ignoreVariants" @change="recalculate">忽略常见异体字</a-checkbox>
+            <a-checkbox v-model="rules.ignorePunctuation" @change="toggleRule('ignorePunctuation')">忽略标点差异</a-checkbox>
+            <a-checkbox v-model="rules.ignoreVariants" @change="toggleRule('ignoreVariants')">忽略常见异体字</a-checkbox>
           </a-space>
           <div style="margin-top: 10px; color: #86909c; font-size: 12px; line-height: 1.6">
             规则只影响相同/改动判断，原始正文始终保留；重算会进入撤销历史。
